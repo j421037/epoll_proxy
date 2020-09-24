@@ -1,1 +1,0 @@
-/usr/bin/c++   -pthread -g   CMakeFiles/epoll_proxy.dir/main.cpp.o  -o epoll_proxy 

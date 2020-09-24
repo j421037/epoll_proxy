@@ -1,3 +1,0 @@
-/home/steve/projects/c++/epoll_proxy/cmake-build-debug/CMakeFiles/rebuild_cache.dir
-/home/steve/projects/c++/epoll_proxy/cmake-build-debug/CMakeFiles/edit_cache.dir
-/home/steve/projects/c++/epoll_proxy/cmake-build-debug/CMakeFiles/epoll_proxy.dir
