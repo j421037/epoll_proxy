@@ -1,0 +1,34 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/steve/projects/c++/epoll_proxy/main.cpp
+iostream
+-
+string
+-
+vector
+-
+thread
+-
+map
+-
+ctime
+-
+sstream
+-
+signal.h
+-
+sys/epoll.h
+-
+unistd.h
+-
+arpa/inet.h
+-
+sys/socket.h
+-
+
