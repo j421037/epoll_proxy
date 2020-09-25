@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 // net
 #include <arpa/inet.h>
@@ -65,10 +66,17 @@ private:
     std::string src_, target_;
     std::map<int, LINK*> links;
 
+    bool fetch_link(int, int*, LINK**);
     int on_connected(int);
+    void on_data_in(int);
+    void on_data_out(int);
+    void on_break(int);
+
     static int do_tcp_listen(sockaddr_in*);
     static int do_tcp_accept(int);
     static int do_tcp_connect(sockaddr_in*);
+    static int do_tcp_recv(int, LINK*);
+    static int do_tcp_send(int, LINK*);
 };
 
 bool StreamSocketProxy::startup(const std::string &src, const unsigned int s_port, const std::string &target, const unsigned int t_port) {
@@ -122,6 +130,25 @@ int StreamSocketProxy::getFd() {
     return sockfd;
 }
 
+// 查找连接
+bool StreamSocketProxy::fetch_link(int fd, int *fd_, LINK **link) {
+    std::map<int, LINK*>::iterator it = links.find(fd);
+
+    if ( it != links.end() ) {
+        *link = it->second;
+        if ( fd == it->second->src_fd ) {
+            *fd_ = it->second->target_fd;
+        }
+        else {
+            *fd_ = it->second->src_fd;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
 // 当有新链接进来
 int StreamSocketProxy::on_connected(int fd) {
     LINK *link = new LINK();
@@ -130,14 +157,31 @@ int StreamSocketProxy::on_connected(int fd) {
     link->src_fd = do_tcp_accept(fd);
     link->target_fd = do_tcp_connect(&tar_addr);
 
-    if ( DEBUG ) {
-        if ( link->target_fd > 0 ) {
-            std::stringstream sstr;
-            sstr << "target: " << target_ << ":" << t_port_ << " connect success, fd: " << link->target_fd;
-            log("debug", sstr.str());
-        }
-    }
+    int flags;
+    // 设置非阻塞
+    flags = fcntl(link->src_fd, F_GETFL, 0);
+    fcntl(link->src_fd, F_SETFL, flags | O_NONBLOCK);
+    flags = fcntl(link->target_fd, F_GETFL, 0);
+    fcntl(link->target_fd, F_SETFL, flags | O_NONBLOCK);
 
+    links.insert(std::make_pair(link->src_fd, link));
+    links.insert(std::make_pair(link->target_fd, link));
+
+    // epoll 事件注册
+    epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = link->src_fd;
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, link->src_fd, &ev);
+    ev.events = EPOLLIN;
+    ev.data.fd = link->target_fd;
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, link->target_fd, &ev);
+
+    std::stringstream sstr;
+    sstr << "src: " << src_ << ":" << s_port_ << " connected success, fd " << link->src_fd;
+    sstr << ", target: " << target_ << ":" << t_port_ << " connect success, fd: " << link->target_fd;
+    log("debug", sstr.str());
+
+    return 1;
 }
 
 // 接受新连接
@@ -148,7 +192,7 @@ int StreamSocketProxy::do_tcp_accept(int fd) {
 
     if ( DEBUG ) {
         std::stringstream sstr;
-        sstr << "accept from fd: " << fd << "accept fd:" << fd_;
+        sstr << "accept from fd: " << fd << ", accept fd:" << fd_;
         log("debug", sstr.str());
     }
 
@@ -168,6 +212,152 @@ int StreamSocketProxy::do_tcp_listen(sockaddr_in *src) {
     if ( listen(fd, SOMAXCONN) < 0 ) { return -1; }
 
     return fd;
+}
+
+// epoll有事件可读
+void StreamSocketProxy::on_data_in(int recv_fd) {
+    LINK *link;
+    int send_fd;
+    std::stringstream sstr;
+    if ( !fetch_link(recv_fd, &send_fd, &link) ) {
+        sstr << "link not found";
+        log("error", sstr.str());
+        return;
+    }
+
+    if ( link->length != 0 ) {
+        // 等待buff 清空
+        return ;
+    }
+
+    int ret = do_tcp_recv(recv_fd, link);
+    if ( ret == 0 ) {
+        return ;
+    }
+    else if ( ret < 0 ) {
+        // 连接可能断开了
+        sstr << "link already disconnect";
+        log("info", sstr.str());
+        on_break(recv_fd);
+    }
+
+    // 连接正常， 发送数据
+    ret = do_tcp_send(send_fd, link);
+    if ( ret == 0 ) {
+        // 发送未完成
+        epoll_event ev;
+        ev.data.fd = send_fd;
+        ev.events = EPOLLIN | EPOLLOUT;
+        epoll_ctl(epollfd, EPOLL_CTL_MOD, send_fd, &ev);
+    }
+    else {
+        if ( ret < 0 ) {
+            // FIXME: error
+        }
+    }
+
+    return ;
+}
+
+// 当有事件可写
+void StreamSocketProxy::on_data_out(int send_fd) {
+    LINK *link;
+    int recv_fd;
+    if ( !fetch_link(send_fd, &recv_fd, &link) ) {
+        return ;
+    }
+
+    // 转发数据
+    int ret = do_tcp_send(recv_fd, link);
+    if ( ret == 0 ){
+        return ;
+    }
+    else {
+        epoll_event ev;
+        ev.data.fd = send_fd;
+        ev.events = EPOLLIN;
+        epoll_ctl(epollfd, EPOLL_CTL_MOD, send_fd, &ev);
+    }
+
+    return ;
+}
+
+// 关闭连接
+void StreamSocketProxy::on_break(int fd) {
+    LINK *link;
+    int fd_;
+
+    if ( !fetch_link(fd, &fd_, &link) ) {
+        return ;
+    }
+
+    // close socket
+    close(fd);
+    close(fd_);
+
+    links.erase(fd);
+    links.erase(fd_);
+    delete link;
+
+    // remove epoll ctl
+    epoll_event ev;
+    std::stringstream sstr;
+    ev.data.fd = fd;
+    epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, &ev);
+    ev.data.fd = fd_;
+    epoll_ctl(epollfd, EPOLL_CTL_DEL, fd_, &ev);
+    sstr << "close fd:" << fd << ", " << fd_;
+    log("info", sstr.str());
+
+    return ;
+}
+
+// 读取数据, 1 成功 ,0 未完成, -1 失败
+int StreamSocketProxy::do_tcp_recv(int fd, LINK *link) {
+    link->length = 0;
+    link->offset = 0;
+
+    int ret = recv(fd, link->buff, PACKET_BUFF_SIZE, 0);
+    if ( ret < 0 ) {
+        if ( errno == EAGAIN ) {
+            return 0;
+        }
+        else {
+            return -1;
+        }
+    }
+    else if ( ret == 0 ) {
+        return -1;
+    }
+
+    link->length = ret;
+
+    return 1;
+}
+
+// 发送数据 1 发送成功， 0 发送未完成 -1发送失败
+int StreamSocketProxy::do_tcp_send(int fd, LINK *link) {
+    int ret;
+    std::stringstream sstr;
+    sstr << "send content to fd: " << fd << ", buff: " << link->buff;
+    log("debug", sstr.str());
+    while ( link->length > 0 ) {
+        ret = send(fd, link->buff + link->offset, link->length, 0);
+        if ( ret < 0 ) {
+            if ( errno == EAGAIN ) {
+                return 0;
+            }
+            else {
+                return -1;
+            }
+        }
+        else {
+            link->length -= ret;
+            link->offset += ret;
+        }
+    }
+
+    return 1;
 }
 
 // 创建tcp连接
@@ -211,12 +401,16 @@ void StreamSocketProxy::serve() {
                 on_connected(sockfd);
             }
             else {
+                // 有事件可读
                 if ( events[i].events & EPOLLIN ) {
                     std::cout << "epoll data in, events[i].events & EPOLLIN: " << (events[i].events & EPOLLIN) << std::endl;
+                    on_data_in(events[i].data.fd);
                 }
 
+                // 有事件可写
                 if ( events[i].events & EPOLLOUT ) {
                     std::cout << "epoll data out, events[i].events & EPOLLOUT: " << (events[i].events & EPOLLOUT) << std::endl;
+                    on_data_out(events[i].data.fd);
                 }
             }
         }
@@ -258,6 +452,7 @@ void ProxyManager::run() {
 
 int main() {
     ProxyManager pm;
+    pm.add("127.0.0.1", 6666, "127.0.0.1", 22);
     pm.add("127.0.0.1", 7777, "127.0.0.1", 22);
     pm.run();
     return 0;
